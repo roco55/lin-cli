@@ -1,0 +1,590 @@
+#!/usr/bin/env bash
+#
+# lin — swap the Linear MCP account bound to a Claude Code project folder.
+#
+# Mirrors a `use-gh`-style workflow: register accounts once, then run
+# `lin use <name>` inside a project to stamp that folder's .mcp.json with
+# the right Linear API key. Claude Code reads .mcp.json on launch, so the
+# bind takes effect the next time you start `claude` in that folder.
+#
+# Storage:
+#   ~/.config/lin/accounts   — "name<TAB>lin_api_key" per line (chmod 600)
+#
+# Commands:
+#   lin add  <name> <key>   register/overwrite an account
+#   lin rm   <name>         remove an account
+#   lin list                list registered account names
+#   lin projects <name>     list that account's real teams & projects (live)
+#   lin use  <name> [more...]  make <name> the active account in THIS folder;
+#                              adds it to the folder's set if new, and promotes
+#                              it to the top. The set only grows. Switch by
+#                              re-running `lin use <name>`.
+#       lin use <name> --team "<Team>"        also default to a team
+#       lin use <name> --project "<Project>"  also default to a project
+#   lin status              show this folder's active account + its set
+#   lin completion <shell>  print shell completion (source it; see below)
+#   lin help                this help
+#
+# Tab-completion (optional): add to your shell rc, then restart the shell:
+#   source <(lin completion zsh)    # ~/.zshrc
+#   source <(lin completion bash)   # ~/.bashrc
+#
+# Everything is per-folder. The only "global" thing is the account registry
+# (~/.config/lin/accounts) — the pool you add keys to and that autocomplete
+# draws from. lin never writes to ~/.claude.json or any global Claude config.
+#
+# Getting a key:
+#   Linear → Settings → Account → Security & Access → "New API key"
+#   https://linear.app/settings/account/security
+#   This static key is separate from the OAuth "Connect Linear" browser flow;
+#   that flow gives no copyable key, so per-folder swapping needs a static one.
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/lin"
+ACCOUNTS_FILE="$CONFIG_DIR/accounts"
+LINEAR_URL="https://mcp.linear.app/mcp"
+# Plain GraphQL API — same key works here, no MCP handshake needed. Used by
+# `lin projects` to list real teams/projects so you pick instead of typing.
+LINEAR_API="https://api.linear.app/graphql"
+# Where to mint a static personal API key (the kind the Bearer header needs).
+# This is NOT the OAuth browser flow that `claude mcp add` uses.
+KEY_URL="https://linear.app/settings/account/security"
+
+err()  { printf 'lin: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# Tell the user where to mint a static API key. Linear's MCP can take a key in
+# the Bearer header instead of the OAuth browser flow that `claude mcp add`
+# (and the Claude/Cursor connector UI) drops you into — that interactive flow
+# never gives you a copyable key, so you make one here.
+key_hint() {
+  cat >&2 <<EOF
+Get a Linear API key here:
+  $KEY_URL
+  (Linear → Settings → Account → Security & Access → "New API key")
+Note: this is a static personal key. It's separate from the OAuth login
+that the Claude/Cursor "Connect Linear" button uses — that flow doesn't
+expose a key, which is why per-folder swapping needs one of these instead.
+EOF
+}
+
+ensure_store() {
+  mkdir -p "$CONFIG_DIR"
+  if [[ ! -f "$ACCOUNTS_FILE" ]]; then
+    touch "$ACCOUNTS_FILE"
+    chmod 600 "$ACCOUNTS_FILE"
+  fi
+}
+
+# Look up a key by account name. Prints key on stdout, empty if not found.
+lookup_key() {
+  local name="$1"
+  awk -F'\t' -v n="$name" '$1 == n { print $2; found=1 } END { exit !found }' \
+    "$ACCOUNTS_FILE" 2>/dev/null || true
+}
+
+cmd_add() {
+  local name="${1:-}" key="${2:-}"
+  if [[ -z "$name" || -z "$key" ]]; then
+    err "usage: lin add <name> <key>"
+    key_hint
+    exit 1
+  fi
+  case "$name" in *$'\t'*) die "account name cannot contain a tab";; esac
+  ensure_store
+  # Drop any existing line for this name, then append the new one.
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'\t' -v n="$name" '$1 != n' "$ACCOUNTS_FILE" > "$tmp" || true
+  printf '%s\t%s\n' "$name" "$key" >> "$tmp"
+  mv "$tmp" "$ACCOUNTS_FILE"
+  chmod 600 "$ACCOUNTS_FILE"
+  printf 'Registered account "%s".\n' "$name"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: lin rm <name>"
+  ensure_store
+  lookup_key "$name" >/dev/null || die "no such account: $name"
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'\t' -v n="$name" '$1 != n' "$ACCOUNTS_FILE" > "$tmp" || true
+  mv "$tmp" "$ACCOUNTS_FILE"
+  chmod 600 "$ACCOUNTS_FILE"
+  printf 'Removed account "%s".\n' "$name"
+}
+
+cmd_list() {
+  ensure_store
+  if [[ ! -s "$ACCOUNTS_FILE" ]]; then
+    echo "No accounts registered. Add one: lin add <name> <key>"
+    key_hint
+    return
+  fi
+  echo "Registered accounts:"
+  awk -F'\t' '{ printf "  %s\n", $1 }' "$ACCOUNTS_FILE"
+}
+
+# POST a GraphQL query to Linear using <account>'s key. Prints raw JSON.
+# Usage: lin_query <account> <graphql-query-string>
+lin_query() {
+  local name="$1" query="$2"
+  command -v curl >/dev/null 2>&1 || die "curl is required for this command"
+  local key
+  key="$(lookup_key "$name")"
+  [[ -n "$key" ]] || die "no such account: $name (see: lin list)"
+
+  # Build the JSON body safely (escape the query) via python3 if available.
+  local body
+  if command -v python3 >/dev/null 2>&1; then
+    body="$(LIN_Q="$query" python3 -c 'import json,os;print(json.dumps({"query":os.environ["LIN_Q"]}))')"
+  else
+    # Fallback: assume the query has no characters needing escaping.
+    body="{\"query\":\"$query\"}"
+  fi
+
+  curl -sS --max-time 30 -X POST "$LINEAR_API" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: $key" \
+    -d "$body"
+}
+
+# List teams (and their projects) for an account, so the user can pick.
+cmd_projects() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: lin projects <account>"
+  ensure_store
+  command -v python3 >/dev/null 2>&1 || die "python3 is required to format results"
+
+  local resp_t resp_p
+  # Two flat queries instead of one deeply-nested one — Linear caps query
+  # complexity, and teams-with-nested-projects exceeds it. Projects carry
+  # their teams, so we group client-side.
+  resp_t="$(lin_query "$name" 'query { teams(first: 250) { nodes { id name key } } }')"
+  resp_p="$(lin_query "$name" 'query { projects(first: 250) { nodes { name teams(first: 10) { nodes { id } } } } }')"
+
+  LIN_ACCT="$name" LIN_TEAMS="$resp_t" LIN_PROJECTS="$resp_p" python3 - <<'PY'
+import json, os, sys
+
+acct = os.environ["LIN_ACCT"]
+
+def parse(label, raw):
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        print(f"lin: could not parse Linear {label} response:", file=sys.stderr)
+        print(raw[:500], file=sys.stderr)
+        sys.exit(1)
+    if "errors" in data:
+        print(f"lin: Linear API error ({label}):", file=sys.stderr)
+        for e in data["errors"]:
+            print("  - " + e.get("message", str(e)), file=sys.stderr)
+        sys.exit(1)
+    return data.get("data") or {}
+
+teams = parse("teams", os.environ["LIN_TEAMS"]).get("teams", {}).get("nodes", [])
+projects = parse("projects", os.environ["LIN_PROJECTS"]).get("projects", {}).get("nodes", [])
+
+if not teams:
+    print(f'No teams visible for account "{acct}".')
+    sys.exit(0)
+
+# Map team id -> list of project names.
+by_team = {t["id"]: [] for t in teams}
+orphan = []
+for p in projects:
+    tids = [n["id"] for n in p.get("teams", {}).get("nodes", [])]
+    placed = False
+    for tid in tids:
+        if tid in by_team:
+            by_team[tid].append(p["name"])
+            placed = True
+    if not placed:
+        orphan.append(p["name"])
+
+print(f'Teams and projects for account "{acct}":\n')
+for t in teams:
+    print(f'  {t["name"]}  [{t.get("key","")}]')
+    names = by_team.get(t["id"], [])
+    if names:
+        for n in names:
+            print(f'      • {n}')
+    else:
+        print('      (no projects)')
+    print()
+if orphan:
+    print('  (projects not tied to a listed team:)')
+    for n in orphan:
+        print(f'      • {n}')
+    print()
+print('Bind a folder with:')
+print(f'  lin use {acct} --team "<Team name>"')
+print(f'  lin use {acct} --project "<Project name>"')
+PY
+}
+
+# Write/replace the "linear" server in a project-local .mcp.json with <key>,
+# preserving any other servers. Records the usable-account list in an "_lin"
+# block so re-running `lin use` and tab-completion know this folder's set.
+# Usage: write_mcp <key> <primary-name> <space-separated-candidate-names>
+write_mcp() {
+  local key="$1" primary="$2" candidates="$3"
+  local target=".mcp.json"
+  if command -v python3 >/dev/null 2>&1; then
+    LIN_KEY="$key" LIN_URL="$LINEAR_URL" LIN_PRIMARY="$primary" \
+    LIN_CANDS="$candidates" python3 - "$target" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (ValueError, OSError):
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+servers = data.setdefault("mcpServers", {})
+servers["linear"] = {
+    "type": "http",
+    "url": os.environ["LIN_URL"],
+    "headers": {"Authorization": "Bearer " + os.environ["LIN_KEY"]},
+}
+# Non-MCP metadata for lin itself. Claude Code ignores unknown top-level keys.
+data["_lin"] = {
+    "primary": os.environ["LIN_PRIMARY"],
+    "accounts": os.environ["LIN_CANDS"].split(),
+}
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+  else
+    # No python3: minimal file, single account, no metadata block.
+    cat > "$target" <<EOF
+{
+  "mcpServers": {
+    "linear": {
+      "type": "http",
+      "url": "$LINEAR_URL",
+      "headers": {
+        "Authorization": "Bearer $key"
+      }
+    }
+  }
+}
+EOF
+  fi
+  chmod 600 "$target"
+}
+
+# Print the space-separated candidate accounts recorded in this folder's
+# .mcp.json (empty if none / no file / no python3).
+get_candidates() {
+  [[ -f ".mcp.json" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - <<'PY' 2>/dev/null || true
+import json
+try:
+    with open(".mcp.json") as f:
+        d = json.load(f)
+    print(" ".join(d.get("_lin", {}).get("accounts", [])))
+except Exception:
+    pass
+PY
+}
+
+# Bind THIS folder to <name> (make it the active account), adding it to the
+# folder's set if new and promoting it to the top. The set only grows.
+# Extra names can be listed too; they're added to the set but <name> stays
+# active (front). Switching = just run `lin use <name>` again.
+cmd_use() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: lin use <name> [more-names...] [--team <name> | --project <name>]"
+  shift || true
+  ensure_store
+
+  # Collect extra positional account names (added to the set) until a flag.
+  local -a extra=()
+  while [[ $# -gt 0 && "$1" != --* ]]; do
+    extra+=("$1"); shift
+  done
+
+  # Optional scope flags: --team / --project.
+  local scope_kind="" scope_name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --team)
+        [[ -n "${2:-}" ]] || die "--team needs a name"
+        scope_kind="team"; scope_name="$2"; shift 2;;
+      --project)
+        [[ -n "${2:-}" ]] || die "--project needs a name"
+        scope_kind="project"; scope_name="$2"; shift 2;;
+      *) die "unknown option: $1";;
+    esac
+  done
+
+  local key
+  key="$(lookup_key "$name")"
+  if [[ -z "$key" ]]; then
+    if [[ ! -s "$ACCOUNTS_FILE" ]]; then
+      err "no accounts registered yet — add one first: lin add <name> <key>"
+      key_hint
+    else
+      err "no such account: $name (see: lin list)"
+    fi
+    exit 1
+  fi
+
+  # Start from the folder's existing set (if any), so re-running `use` grows
+  # rather than replaces. Build the new ordered list as: <name> first, then
+  # the existing members, then any extras — de-duplicated.
+  local existing
+  existing="$(get_candidates)"
+
+  local -a candidates=("$name")
+  local item seen c
+  # validate + append extras to a working pool first
+  local -a pool=()
+  for item in $existing "${extra[@]:-}"; do
+    [[ -z "$item" ]] && continue
+    pool+=("$item")
+  done
+  for item in "${pool[@]:-}"; do
+    [[ -z "$item" ]] && continue
+    # validate names that came from the command line (extras); existing ones
+    # were validated when first added, but re-checking is cheap and safe.
+    lookup_key "$item" >/dev/null 2>&1 || die "no such account: $item (see: lin list)"
+    seen=""
+    for c in "${candidates[@]}"; do [[ "$c" == "$item" ]] && seen=1; done
+    [[ -z "$seen" ]] && candidates+=("$item")
+  done
+
+  write_mcp "$key" "$name" "${candidates[*]}"
+  ensure_gitignore
+  printf 'Active account here: "%s".\n' "$name"
+  if [[ ${#candidates[@]} -gt 1 ]]; then
+    printf 'Available in this folder: %s\n' "${candidates[*]}"
+    printf '  switch by re-running: lin use <name>\n'
+  fi
+
+  # If a team/project scope was given, write it as an always-on default into
+  # CLAUDE.md so Claude Code defaults Linear ops to it within this account.
+  if [[ -n "$scope_kind" ]]; then
+    write_scope "$scope_kind" "$scope_name"
+    printf 'Default Linear %s set to "%s" (in CLAUDE.md).\n' "$scope_kind" "$scope_name"
+  fi
+
+  printf 'Restart `claude` in this folder for it to take effect.\n'
+}
+
+# Insert/replace a managed Linear-scope block in CLAUDE.md. Idempotent: the
+# block lives between markers so re-running just updates it in place.
+write_scope() {
+  local kind="$1" value="$2"
+  local file="CLAUDE.md"
+  local begin="<!-- lin:scope:begin -->"
+  local end="<!-- lin:scope:end -->"
+
+  LIN_KIND="$kind" LIN_VALUE="$value" LIN_FILE="$file" \
+  LIN_BEGIN="$begin" LIN_END="$end" python3 - <<'PY'
+import os
+kind  = os.environ["LIN_KIND"]
+value = os.environ["LIN_VALUE"]
+path  = os.environ["LIN_FILE"]
+begin = os.environ["LIN_BEGIN"]
+end   = os.environ["LIN_END"]
+
+block = (
+    f"{begin}\n"
+    f"## Linear\n"
+    f'Default Linear {kind} for this folder: "{value}".\n'
+    f"When using Linear, default to this {kind} unless I explicitly name a "
+    f"different team or project. Don't create or modify issues in other "
+    f"{kind}s without being asked.\n"
+    f"{end}"
+)
+
+try:
+    with open(path) as f:
+        text = f.read()
+except OSError:
+    text = ""
+
+if begin in text and end in text:
+    pre = text[: text.index(begin)]
+    post = text[text.index(end) + len(end):]
+    text = pre + block + post
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text:
+        text += "\n"
+    text += block + "\n"
+
+with open(path, "w") as f:
+    f.write(text)
+PY
+}
+
+# Make sure .mcp.json won't get committed (it holds a live key).
+ensure_gitignore() {
+  [[ -d .git ]] || return 0
+  local gi=".gitignore"
+  if [[ -f "$gi" ]] && grep -qxF ".mcp.json" "$gi"; then
+    return 0
+  fi
+  printf '.mcp.json\n' >> "$gi"
+  printf 'Added .mcp.json to %s\n' "$gi"
+}
+
+cmd_status() {
+  local target=".mcp.json"
+  if [[ ! -f "$target" ]]; then
+    echo "This folder is not bound. Run: lin use <name>"
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo ".mcp.json present (install python3 for account-name detection)."
+    return
+  fi
+  ensure_store
+  # Extract the bound key, then reverse-map it to a registered name.
+  local bound_key
+  bound_key="$(python3 - "$target" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    h = d["mcpServers"]["linear"]["headers"]["Authorization"]
+    print(h.split("Bearer ", 1)[1].strip() if "Bearer " in h else "")
+except Exception:
+    print("")
+PY
+)"
+  if [[ -z "$bound_key" ]]; then
+    echo ".mcp.json present but has no Linear server bound."
+    return
+  fi
+  local name
+  name="$(awk -F'\t' -v k="$bound_key" '$2 == k { print $1; exit }' "$ACCOUNTS_FILE")"
+  if [[ -n "$name" ]]; then
+    printf 'Active account here: "%s".\n' "$name"
+  else
+    echo "Active key here is unregistered (…${bound_key: -6})."
+  fi
+
+  # Show the rest of the folder's set, if more than one is recorded here.
+  local cands
+  cands="$(get_candidates)"
+  if [[ -n "$cands" ]]; then
+    local count
+    count="$(printf '%s\n' $cands | wc -w | tr -d ' ')"
+    if [[ "$count" -gt 1 ]]; then
+      printf 'Available in this folder: %s  (switch: lin use <name>)\n' "$cands"
+    fi
+  fi
+
+  # Report the team/project scope if CLAUDE.md has a lin-managed block.
+  if [[ -f "CLAUDE.md" ]]; then
+    local scope
+    scope="$(grep -oE 'Default Linear (team|project) for this folder: "[^"]*"' CLAUDE.md | head -1 || true)"
+    [[ -n "$scope" ]] && printf '%s\n' "$scope"
+  fi
+}
+
+cmd_help() {
+  # Print the leading comment block (everything before `set -euo pipefail`),
+  # skipping the shebang, with the "# " prefix stripped.
+  sed -n '2,/^set -euo pipefail/p' "$0" | sed '/^set -euo pipefail/d; s/^# \{0,1\}//'
+}
+
+# Hidden helpers for shell completion.
+#   __complete use      -> folder's accounts if bound, else all registered
+#   __complete accounts -> all registered account names
+cmd___complete() {
+  case "${1:-}" in
+    use)
+      local f
+      f="$(get_candidates)"
+      if [[ -n "$f" ]]; then
+        printf '%s\n' $f
+      else
+        ensure_store; awk -F'\t' '{print $1}' "$ACCOUNTS_FILE"
+      fi
+      ;;
+    accounts|*) ensure_store; awk -F'\t' '{print $1}' "$ACCOUNTS_FILE" ;;
+  esac
+}
+
+# Emit shell completion code for the user to source. Usage:
+#   source <(lin completion zsh)   # in ~/.zshrc
+#   source <(lin completion bash)  # in ~/.bashrc
+# Auto-detects the shell if no argument is given.
+cmd_completion() {
+  local shell="${1:-}"
+  if [[ -z "$shell" ]]; then
+    [[ -n "${ZSH_VERSION:-}" ]] && shell="zsh"
+    [[ -n "${BASH_VERSION:-}" ]] && shell="bash"
+  fi
+  case "$shell" in
+    zsh)
+      cat <<'EOF'
+_lin() {
+  # NB: do not `local words` / `local CURRENT` — they are special parameters
+  # the completion system fills in for us; redeclaring them shadows the real
+  # command line and breaks sub-command completion.
+  if (( CURRENT == 2 )); then
+    compadd -- add rm list projects use status completion help
+    return
+  fi
+  case "${words[2]}" in
+    use)         compadd -- ${(f)"$(lin __complete use 2>/dev/null)"} --team --project ;;
+    rm|projects) compadd -- ${(f)"$(lin __complete accounts 2>/dev/null)"} ;;
+    completion)  compadd -- zsh bash ;;
+  esac
+}
+compdef _lin lin
+EOF
+      ;;
+    bash)
+      cat <<'EOF'
+_lin() {
+  local cur; cur="${COMP_WORDS[COMP_CWORD]}"
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "add rm list projects use status completion help" -- "$cur") )
+    return
+  fi
+  case "${COMP_WORDS[1]}" in
+    use)         COMPREPLY=( $(compgen -W "$(lin __complete use 2>/dev/null) --team --project" -- "$cur") ) ;;
+    rm|projects) COMPREPLY=( $(compgen -W "$(lin __complete accounts 2>/dev/null)" -- "$cur") ) ;;
+    completion)  COMPREPLY=( $(compgen -W "zsh bash" -- "$cur") ) ;;
+  esac
+}
+complete -F _lin lin
+EOF
+      ;;
+    *)
+      die "usage: lin completion <bash|zsh>  (couldn't auto-detect your shell)"
+      ;;
+  esac
+}
+
+main() {
+  local sub="${1:-help}"
+  shift || true
+  case "$sub" in
+    add)    cmd_add "$@";;
+    rm)     cmd_rm "$@";;
+    list)   cmd_list "$@";;
+    projects) cmd_projects "$@";;
+    use)    cmd_use "$@";;
+    status) cmd_status "$@";;
+    completion) cmd_completion "$@";;
+    __complete) cmd___complete "$@";;
+    help|-h|--help) cmd_help;;
+    *) die "unknown command: $sub (try: lin help)";;
+  esac
+}
+
+main "$@"

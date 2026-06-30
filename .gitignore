@@ -1,0 +1,7 @@
+# Never commit a project-local MCP config — it holds a live Linear API key.
+.mcp.json
+
+# Local account registry, if anyone keeps it alongside the repo.
+accounts
+
+.DS_Store
